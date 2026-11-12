@@ -52,6 +52,8 @@ from sqlglot.expressions import (
 from sqlglot.generator import Generator as Generator
 from sqlglot.parser import Parser as Parser
 from sqlglot.schema import MappingSchema as MappingSchema, Schema as Schema
+from sqlglot.tenant import TenantFilterError as TenantFilterError
+from sqlglot.tenant import add_tenant_filter as add_tenant_filter
 from sqlglot.tokens import Token as Token, Tokenizer as Tokenizer, TokenType as TokenType
 
 if t.TYPE_CHECKING:
