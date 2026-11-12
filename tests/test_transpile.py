@@ -2,7 +2,7 @@ import os
 import unittest
 from unittest import mock
 
-from sqlglot import parse_one, transpile
+from sqlglot import exp, parse, parse_one, transpile
 from sqlglot.errors import ErrorLevel, ParseError, UnsupportedError
 from sqlglot.helper import logger as helper_logger
 from sqlglot.parser import logger as parser_logger
@@ -1207,3 +1207,123 @@ WHERE
         sql = "1 AND 2 OR 3 AND " * 1000
         sql += "4"
         self.assertEqual(len(parse_one(sql).sql()), 17001)
+
+
+class TestTranspileStringLiteralSafety(unittest.TestCase):
+    """Safety tests for transpiling string literals whose contents are significant to
+    the target dialect's tokenizer: semicolons, comment markers, quotes, backslashes.
+
+    Every sample is checked twice: the source SQL is compared against a fixed expected
+    AST, and the transpiled output is re-parsed with the target dialect to prove it is
+    still a single statement carrying the exact same literal value.
+    """
+
+    maxDiff = None
+
+    def assert_literal_round_trip(self, sql, read, write, expected_value, expected_ast=None):
+        source_ast = parse_one(sql, read=read)
+        self.assertEqual(
+            source_ast,
+            expected_ast or exp.select(exp.Literal.string(expected_value)),
+            f"source {read!r} parsed to an unexpected AST",
+        )
+
+        output = transpile(sql, read=read, write=write)[0]
+
+        statements = [statement for statement in parse(output, read=write) if statement]
+        self.assertEqual(
+            len(statements),
+            1,
+            f"{write} output is not a single statement: {output!r}",
+        )
+
+        literals = [
+            literal.this for literal in statements[0].find_all(exp.Literal) if literal.is_string
+        ]
+        self.assertEqual(
+            literals,
+            [expected_value],
+            f"literal value changed after re-parsing the {write} output {output!r}",
+        )
+        return output
+
+    def test_statement_breakers_stay_inside_literal(self):
+        # Semicolons and comment markers inside a string must not terminate the statement
+        # or start a comment in the target dialect.
+        for read, write in (
+            ("mysql", "postgres"),
+            ("postgres", "mysql"),
+            ("mysql", "tsql"),
+            ("postgres", "hive"),
+        ):
+            with self.subTest(f"semicolon, {read} -> {write}"):
+                self.assert_literal_round_trip("SELECT 'a;b'", read, write, "a;b")
+            with self.subTest(f"line comment marker, {read} -> {write}"):
+                self.assert_literal_round_trip("SELECT 'a--b'", read, write, "a--b")
+            with self.subTest(f"block comment markers, {read} -> {write}"):
+                self.assert_literal_round_trip("SELECT 'a/*b*/c'", read, write, "a/*b*/c")
+            with self.subTest(f"injection-looking text, {read} -> {write}"):
+                self.assert_literal_round_trip(
+                    "SELECT '; DROP TABLE t; --'", read, write, "; DROP TABLE t; --"
+                )
+
+    def test_escape_handoff_between_dialects(self):
+        # MySQL reads \n as an escape; Postgres strings have no backslash escapes, so the
+        # value must be carried by a literal newline instead of the two-character text.
+        output = self.assert_literal_round_trip(r"SELECT 'a\nb'", "mysql", "postgres", "a\nb")
+        self.assertEqual(output, "SELECT 'a\nb'")
+
+        # Postgres reads the backslash literally; MySQL/Hive treat it as an escape
+        # introducer, so the backslash must be doubled to survive the re-parse.
+        output = self.assert_literal_round_trip(r"SELECT 'a\b'", "postgres", "mysql", "a\\b")
+        self.assertEqual(output, r"SELECT 'a\\b'")
+        output = self.assert_literal_round_trip(r"SELECT 'a\b'", "postgres", "hive", "a\\b")
+        self.assertEqual(output, r"SELECT 'a\\b'")
+
+        # MySQL reads \b as the backspace control character; the transpiled Postgres
+        # output must round-trip the control character itself, not the text "\b".
+        self.assert_literal_round_trip(r"SELECT 'a\b'", "mysql", "postgres", "a\x08")
+
+    def test_quote_styles(self):
+        # MySQL doubles the quote to escape it; Hive escapes it with a backslash.
+        output = self.assert_literal_round_trip("SELECT 'it''s'", "mysql", "hive", "it's")
+        self.assertEqual(output, r"SELECT 'it\'s'")
+
+        # Postgres dollar-quoting has no escaping at all; MySQL needs quote doubling.
+        output = self.assert_literal_round_trip(
+            "SELECT $$it's$$",
+            "postgres",
+            "mysql",
+            "it's",
+            expected_ast=exp.select(exp.RawString(this="it's")),
+        )
+        self.assertEqual(output, "SELECT 'it''s'")
+
+    def test_unsupported_literal_raises_with_details(self):
+        # Postgres E'...' is parsed as a byte string, which several target dialects
+        # cannot express; the error must name the unsupported part and the dialect.
+        for write in ("tsql", "oracle", "sqlite", "presto"):
+            with self.subTest(f"postgres -> {write}"):
+                with self.assertRaises(UnsupportedError) as ctx:
+                    transpile(
+                        r"SELECT E'a\nb'",
+                        read="postgres",
+                        write=write,
+                        unsupported_level=ErrorLevel.RAISE,
+                    )
+                message = str(ctx.exception)
+                self.assertIn("Byte strings", message)
+                self.assertIn(write.upper(), message.upper())
+
+    def test_verbatim_text_copy_misparses_in_target(self):
+        # Trap sample: the MySQL text SELECT 'a\nb' is also syntactically valid Postgres,
+        # so copying it verbatim looks correct -- but Postgres has no backslash escapes,
+        # so the re-parsed literal is the two characters "\n", not a newline.
+        naive_output = r"SELECT 'a\nb'"
+        reparsed = parse_one(naive_output, read="postgres")
+        literal = reparsed.expressions[0]
+        self.assertEqual(literal.this, "a\\nb")
+        self.assertNotEqual(literal.this, "a\nb")
+
+        # The actual transpiler avoids the trap by emitting a literal newline instead.
+        self.assert_literal_round_trip(r"SELECT 'a\nb'", "mysql", "postgres", "a\nb")
