@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 import sqlglot
-from sqlglot.lineage import lineage
+from sqlglot.lineage import lineage, lineage_sources
 from sqlglot.schema import MappingSchema
 
 
@@ -1379,3 +1379,128 @@ class TestLineage(unittest.TestCase):
                 seen.add(id(node))
         for nid in seen:
             self.assertEqual(counts.get(nid, 0), 1)
+
+    def test_lineage_sources_union_same_output_name(self) -> None:
+        # Both UNION branches project `label`; the report must include the
+        # sources of *every* branch, not just the first one.
+        schema = {"public_t": {"public_col": "INT"}, "sensitive_t": {"sensitive_col": "TEXT"}}
+        sql = """
+        SELECT public_col AS label FROM public_t
+        UNION ALL
+        SELECT sensitive_col AS label FROM sensitive_t
+        """
+
+        (result,) = lineage_sources(None, sql, schema=schema)
+        self.assertEqual(result.name, "label")
+        self.assertEqual(result.position, 0)
+        self.assertEqual(
+            {(s.table, s.column) for s in result.sources},
+            {("public_t", "public_col"), ("sensitive_t", "sensitive_col")},
+        )
+        self.assertEqual(result.unresolved, ())
+        self.assertFalse(result.requires_confirmation)
+
+        # The Node returned by lineage() exposes the same complete view.
+        node = lineage("label", sql, schema=schema)
+        self.assertEqual(
+            {(s.table, s.column) for s in node.sources},
+            {("public_t", "public_col"), ("sensitive_t", "sensitive_col")},
+        )
+        self.assertFalse(node.requires_confirmation)
+
+    def test_lineage_sources_nested_cte(self) -> None:
+        schema = {"public_t": {"public_col": "INT"}, "sensitive_t": {"sensitive_col": "TEXT"}}
+        sql = """
+        WITH a AS (SELECT public_col AS label FROM public_t),
+             b AS (SELECT label FROM a),
+             c AS (SELECT sensitive_col AS label FROM sensitive_t)
+        SELECT label FROM b UNION ALL SELECT label FROM c
+        """
+
+        (result,) = lineage_sources("label", sql, schema=schema)
+        self.assertEqual(
+            {(s.table, s.column) for s in result.sources},
+            {("public_t", "public_col"), ("sensitive_t", "sensitive_col")},
+        )
+        self.assertFalse(result.requires_confirmation)
+
+    def test_lineage_sources_duplicate_output_alias(self) -> None:
+        # Duplicate output aliases are kept as separate, position-aware entries
+        # instead of being collapsed into one name-keyed dict entry.
+        results = lineage_sources(
+            None, "SELECT a AS label, b AS label FROM t", schema={"t": {"a": "INT", "b": "INT"}}
+        )
+
+        self.assertEqual([r.position for r in results], [0, 1])
+        self.assertEqual([r.name for r in results], ["label", "label"])
+        self.assertEqual(
+            [[(s.table, s.column) for s in r.sources] for r in results],
+            [[("t", "a")], [("t", "b")]],
+        )
+        self.assertTrue(all(not r.requires_confirmation for r in results))
+
+    def test_lineage_sources_ambiguous_column(self) -> None:
+        # An unqualified column with multiple candidate sources must be
+        # reported as unresolved, not silently attributed or treated as public.
+        (result,) = lineage_sources(
+            None, "SELECT x AS label FROM t1 JOIN t2 ON t1.id = t2.id", schema={}
+        )
+
+        self.assertEqual(result.sources, ())
+        self.assertTrue(result.requires_confirmation)
+        self.assertEqual(len(result.unresolved), 1)
+        self.assertIn("ambiguous", result.unresolved[0].reason)
+
+        node = lineage("label", "SELECT x AS label FROM t1 JOIN t2 ON t1.id = t2.id", schema={})
+        self.assertEqual(node.sources, ())
+        self.assertTrue(node.requires_confirmation)
+
+    def test_lineage_sources_star(self) -> None:
+        # With a schema, `*` is expanded and each output column gets a position
+        # and a fully-resolved source.
+        results = lineage_sources(None, "SELECT * FROM t", schema={"t": {"a": "INT", "b": "INT"}})
+        self.assertEqual([r.name for r in results], ["a", "b"])
+        self.assertEqual([r.position for r in results], [0, 1])
+        self.assertEqual(
+            [[(s.table, s.column) for s in r.sources] for r in results],
+            [[("t", "a")], [("t", "b")]],
+        )
+        self.assertTrue(all(not r.requires_confirmation for r in results))
+
+        # Without a schema the output columns are unknown: no sources are
+        # reported and the entry is flagged for manual confirmation.
+        (result,) = lineage_sources(None, "SELECT * FROM t", schema={})
+        self.assertEqual(result.name, "*")
+        self.assertEqual(result.sources, ())
+        self.assertTrue(result.requires_confirmation)
+        self.assertIn("schema", result.unresolved[0].reason)
+
+    def test_lineage_sources_unexpanded_star_cte(self) -> None:
+        # A column inferred through an unexpanded `*` has an unknown source and
+        # must not be treated as coming from a known (public) field.
+        (result,) = lineage_sources(
+            None, "WITH c AS (SELECT * FROM t) SELECT a FROM c", schema={}
+        )
+        self.assertEqual(result.name, "a")
+        self.assertEqual(result.sources, ())
+        self.assertTrue(result.requires_confirmation)
+        self.assertIn("'*'", result.unresolved[0].reason)
+
+    def test_lineage_sources_to_dict(self) -> None:
+        (result,) = lineage_sources(
+            None, "SELECT a AS label FROM t", schema={"t": {"a": "INT"}}
+        )
+        self.assertEqual(
+            result.to_dict(),
+            {
+                "name": "label",
+                "position": 0,
+                "sources": [{"table": "t", "column": "a", "expression": "t AS t"}],
+                "unresolved": [],
+                "requires_confirmation": False,
+            },
+        )
+
+    def test_lineage_sources_unknown_column(self) -> None:
+        with self.assertRaises(sqlglot.errors.SqlglotError):
+            lineage_sources("nope", "SELECT a FROM t", schema={"t": {"a": "INT"}})

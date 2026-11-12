@@ -510,3 +510,13 @@ This approach incrementally builds a linked list of `Nodes` that traces the line
 The `lineage()` output can be visualized using the `node.to_html()` function, which generates an HTML lineage graph using `vis.js`.
 
 ![Lineage](onboarding_images/lineage_img.png)
+
+### Source reports for downstream consumers
+
+Consumers that need to decide whether an output column derives from a sensitive field can use `lineage_sources()`, which returns one `ColumnLineage` per output projection:
+
+- `position` preserves the projection's position, so duplicate output aliases are not collapsed (unlike `lineage()`'s name-keyed dict).
+- `sources` lists every fully-resolved base source (`SourceRef` with `table`/`column`), including all branches of a `UNION` that share one output name.
+- `unresolved` lists the parts that could not be resolved (e.g. an unexpanded `*` without a schema, or an ambiguous unqualified column), each with a reason.
+
+An empty `sources` is never proof that a column is public — check `requires_confirmation`/`unresolved` first. The same information is available on any `Node` via its `sources`, `unresolved`, and `requires_confirmation` properties.

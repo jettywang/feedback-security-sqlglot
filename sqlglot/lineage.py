@@ -20,6 +20,40 @@ if t.TYPE_CHECKING:
 logger = logging.getLogger("sqlglot")
 
 
+# Reason used when a `*` projection reaches the lineage graph unexpanded, which
+# means the output columns (and therefore their sources) cannot be enumerated.
+STAR_NOT_EXPANDED_REASON = (
+    "'*' projection was not expanded (schema unavailable or star expansion disabled); "
+    "the output columns are unknown"
+)
+
+
+@dataclass(frozen=True)
+class SourceRef:
+    """A fully-resolved base source of an output column.
+
+    `table` is the full table name and `column` the column within it. For sources
+    that are not tables (e.g. a `VALUES` clause or a UDTF), `table` is empty and
+    `expression` carries the source's SQL.
+    """
+
+    table: str
+    column: str
+    expression: str = ""
+
+
+@dataclass(frozen=True)
+class UnresolvedSource:
+    """A part of a column's lineage that could not be fully resolved.
+
+    Consumers must treat these as unknown, not as "public" columns.
+    """
+
+    reason: str
+    name: str = ""
+    expression: str = ""
+
+
 @dataclass(frozen=True)
 class Node:
     name: str
@@ -32,6 +66,9 @@ class Node:
     # Caller-injected per-node data, populated via the `on_node` hook on lineage()
     payload: dict[str, t.Any] = field(default_factory=dict)
 
+    # Why this node's source could not be fully resolved ("" when fully resolved)
+    uncertainty_reason: str = ""
+
     def walk(self) -> Iterator[Node]:
         visited: set[int] = set()
         queue = [self]
@@ -43,6 +80,31 @@ class Node:
             visited.add(node_id)
             yield node
             queue.extend(reversed(node.downstream))
+
+    @property
+    def is_unresolved(self) -> bool:
+        """Whether this node's source could not be fully resolved."""
+        return bool(self.uncertainty_reason) or isinstance(self.source, exp.Placeholder)
+
+    @property
+    def sources(self) -> tuple[SourceRef, ...]:
+        """All fully-resolved base sources reachable from this node.
+
+        Unresolved subtrees (e.g. an unexpanded `*` or an ambiguous column) are
+        excluded here and reported through `unresolved` instead, so that an
+        unknown source is never silently treated as a public field.
+        """
+        return _collect_refs(self)[0]
+
+    @property
+    def unresolved(self) -> tuple[UnresolvedSource, ...]:
+        """The parts of this node's lineage that could not be fully resolved."""
+        return _collect_refs(self)[1]
+
+    @property
+    def requires_confirmation(self) -> bool:
+        """Whether any part of this node's lineage needs manual confirmation."""
+        return bool(self.unresolved)
 
     def to_html(self, dialect: DialectType = None, **opts: Unpack[GraphHTMLArgs]) -> GraphHTML:
         nodes = {}
@@ -76,6 +138,86 @@ class Node:
             for d in node.downstream:
                 edges.append({"from": node_id, "to": id(d)})
         return GraphHTML(nodes, edges, **opts)
+
+
+@dataclass(frozen=True)
+class ColumnLineage:
+    """Position-aware source report for a single output column.
+
+    Unlike `lineage()`'s name-keyed dict, this preserves duplicate output names
+    by carrying the projection's `position`, and it separates fully-resolved
+    `sources` from `unresolved` parts so consumers never mistake an unknown
+    source for a public field.
+    """
+
+    name: str
+    position: int | None
+    node: Node
+    sources: tuple[SourceRef, ...]
+    unresolved: tuple[UnresolvedSource, ...]
+
+    @property
+    def requires_confirmation(self) -> bool:
+        """Whether any part of this column's lineage needs manual confirmation."""
+        return bool(self.unresolved)
+
+    def to_dict(self) -> dict[str, t.Any]:
+        return {
+            "name": self.name,
+            "position": self.position,
+            "sources": [
+                {"table": s.table, "column": s.column, "expression": s.expression}
+                for s in self.sources
+            ],
+            "unresolved": [
+                {"name": u.name, "reason": u.reason, "expression": u.expression}
+                for u in self.unresolved
+            ],
+            "requires_confirmation": self.requires_confirmation,
+        }
+
+
+def _prepare_scope(
+    sql: str | exp.Expr,
+    schema: dict | Schema,
+    sources: Mapping[str, str | exp.Query] | None,
+    dialect: DialectType,
+    scope: Scope | None,
+    copy: bool,
+    kwargs: dict[str, t.Any],
+) -> tuple[Scope, Schema, exp.Selectable]:
+    expression = maybe_parse(sql, copy=copy, dialect=dialect)
+
+    if sources:
+        expression = exp.expand(
+            expression,
+            {
+                k: t.cast(exp.Query, maybe_parse(v, copy=copy, dialect=dialect))
+                for k, v in sources.items()
+            },
+            dialect=dialect,
+            copy=copy,
+        )
+
+    schema = ensure_schema(schema, dialect=dialect)
+
+    if not scope:
+        expression = qualify.qualify(
+            expression,
+            dialect=dialect,
+            schema=schema,
+            **{"validate_qualify_columns": False, "identify": False, **kwargs},  # type: ignore
+        )
+        scope = build_scope(expression)
+
+    if not scope:
+        raise SqlglotError("Cannot build lineage, sql must be SELECT")
+
+    selectable = scope.expression
+    if not isinstance(selectable, exp.Selectable):
+        raise SqlglotError("Cannot build lineage, sql must be a query")
+
+    return scope, schema, selectable
 
 
 @t.overload
@@ -124,37 +266,13 @@ def lineage(
 
     Returns:
         A Node when `column` is provided, or a dict[str, Node] when `column` is None.
+
+    Note:
+        The name-keyed dict collapses duplicate output aliases and does not
+        carry projection positions. Use `lineage_sources` for a position-aware
+        report that also surfaces unresolved parts of the graph.
     """
-    expression = maybe_parse(sql, copy=copy, dialect=dialect)
-
-    if sources:
-        expression = exp.expand(
-            expression,
-            {
-                k: t.cast(exp.Query, maybe_parse(v, copy=copy, dialect=dialect))
-                for k, v in sources.items()
-            },
-            dialect=dialect,
-            copy=copy,
-        )
-
-    schema = ensure_schema(schema, dialect=dialect)
-
-    if not scope:
-        expression = qualify.qualify(
-            expression,
-            dialect=dialect,
-            schema=schema,
-            **{"validate_qualify_columns": False, "identify": False, **kwargs},  # type: ignore
-        )
-        scope = build_scope(expression)
-
-    if not scope:
-        raise SqlglotError("Cannot build lineage, sql must be SELECT")
-
-    selectable = scope.expression
-    if not isinstance(selectable, exp.Selectable):
-        raise SqlglotError("Cannot build lineage, sql must be a query")
+    scope, schema, selectable = _prepare_scope(sql, schema, sources, dialect, scope, copy, kwargs)
 
     cache: dict[tuple, Node] = {}
     scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] = {}
@@ -197,6 +315,95 @@ def lineage(
     return result
 
 
+def lineage_sources(
+    column: str | exp.Column | None,
+    sql: str | exp.Expr,
+    schema: dict | Schema,
+    sources: Mapping[str, str | exp.Query] | None = None,
+    dialect: DialectType = None,
+    scope: Scope | None = None,
+    trim_selects: bool = True,
+    copy: bool = True,
+    on_node: t.Callable[[Node], None] | None = None,
+    **kwargs,
+) -> list[ColumnLineage]:
+    """Build a position-aware source report for a query's output columns.
+
+    This is a companion to `lineage()` aimed at consumers (e.g. export
+    services) that need to decide whether an output column derives from a
+    sensitive field:
+
+    - Every output projection is reported by `position`, so duplicate output
+      aliases (e.g. two projections both named `label`) are not collapsed.
+    - `sources` contains the complete set of resolved base sources, including
+      every branch of a UNION, even when all branches share one output name.
+    - `unresolved` carries the parts that could not be resolved (unexpanded
+      `*` without a schema, ambiguous unqualified columns, missing sources),
+      each with a reason. An empty `sources` is never a proof that a column is
+      public: check `requires_confirmation` and `unresolved` first.
+
+    Args:
+        column: Restrict the report to this output column. Pass None to report
+            on every top-level output column.
+        sql: The SQL string or expression.
+        schema: The schema of tables.
+        sources: A mapping of queries which will be used to continue building lineage.
+        dialect: The dialect of input SQL.
+        scope: A pre-created scope to use instead.
+        trim_selects: Whether to clean up selects by trimming to only relevant columns.
+        copy: Whether to copy the Expr arguments.
+        on_node: Optional callback invoked for every Node created during the walk.
+        **kwargs: Qualification optimizer kwargs.
+
+    Returns:
+        A list of ColumnLineage, one per output projection (per match when
+        `column` is provided), in projection order.
+    """
+    scope, schema, selectable = _prepare_scope(sql, schema, sources, dialect, scope, copy, kwargs)
+
+    selects = selectable.selects
+    names = [select.alias_or_name for select in selects]
+
+    if column is not None:
+        column_name = normalize_identifiers.normalize_identifiers(column, dialect=dialect).name
+        positions = [i for i, name in enumerate(names) if name == column_name]
+        if not positions:
+            raise SqlglotError(f"Cannot find column '{column_name}' in query.")
+    else:
+        positions = list(range(len(selects)))
+
+    cache: dict[tuple, Node] = {}
+    scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] = {}
+
+    report = []
+    for position in positions:
+        name = names[position]
+        # Resolve by position when the name is missing (e.g. `*`) or ambiguous
+        # (duplicate output aliases), so each projection gets its own graph.
+        key = position if not name or names.count(name) > 1 else name
+        node = to_node(
+            key,
+            scope,
+            dialect,
+            trim_selects=trim_selects,
+            schema=schema,
+            _cache=cache,
+            _scope_meta=scope_meta,
+            on_node=on_node,
+        )
+        report.append(
+            ColumnLineage(
+                name=name or selects[position].sql(dialect=dialect),
+                position=position,
+                node=node,
+                sources=node.sources,
+                unresolved=node.unresolved,
+            )
+        )
+
+    return report
+
+
 def to_node(
     column: str | int,
     scope: Scope,
@@ -222,6 +429,7 @@ def to_node(
     # Find the specific select clause that is the source of the column we want.
     # This can either be a specific, named select or a generic `*` clause.
     selectable = t.cast(exp.Selectable, scope.expression)
+    uncertainty_reason = ""
     if isinstance(column, int):
         if column >= len(selectable.selects):
             raise SqlglotError(
@@ -232,9 +440,10 @@ def to_node(
         # Resolving a column to its select scans selectable.selects on every call;
         # memoize a per-scope {name: select} map and is_star bit instead.
         if _scope_meta is None:
-            select = next(
+            is_star = selectable.is_star
+            resolved_select = next(
                 (s for s in selectable.selects if s.alias_or_name == column),
-                exp.Star() if selectable.is_star else scope.expression,
+                None,
             )
         else:
             scope_id = id(scope)
@@ -246,7 +455,22 @@ def to_node(
                 meta = (selectable.is_star, select_by_name)
                 _scope_meta[scope_id] = meta
             is_star, select_by_name = meta
-            select = select_by_name.get(column, exp.Star() if is_star else scope.expression)
+            resolved_select = select_by_name.get(column)
+
+        if resolved_select is None:
+            if is_star:
+                select = exp.Star()
+                uncertainty_reason = (
+                    f"column '{column}' is not explicitly projected and was inferred "
+                    f"from an unexpanded '*' projection"
+                )
+            else:
+                select = scope.expression
+                uncertainty_reason = (
+                    f"column '{column}' could not be found in the projections of this scope"
+                )
+        else:
+            select = resolved_select
 
     if isinstance(scope.expression, exp.Subquery):
         for inner_scope in scope.subquery_scopes:
@@ -272,7 +496,12 @@ def to_node(
     if isinstance(scope.expression, exp.SetOperation):
         name = type(scope.expression).__name__.upper()
         created_setop = upstream is None
-        upstream = upstream or Node(name=name, source=scope.expression, expression=select)
+        upstream = upstream or Node(
+            name=name,
+            source=scope.expression,
+            expression=select,
+            uncertainty_reason=uncertainty_reason,
+        )
 
         index = (
             column
@@ -320,6 +549,19 @@ def to_node(
     else:
         source = scope.expression
 
+    subquery_scopes = {
+        id(subquery_scope.expression): subquery_scope for subquery_scope in scope.subquery_scopes
+    }
+    in_scope_subqueries = list(find_all_in_scope(select, *exp.UNWRAPPED_QUERIES))
+
+    reasons = [uncertainty_reason] if uncertainty_reason else []
+    for subquery in in_scope_subqueries:
+        if id(subquery) not in subquery_scopes:
+            logger.warning(f"Unknown subquery scope: {subquery.sql(dialect=dialect)}")
+            reasons.append(
+                f"subquery scope could not be resolved: {subquery.sql(dialect=dialect)}"
+            )
+
     # Create the node for this step in the lineage chain, and attach it to the previous one.
     node = Node(
         name=f"{scope_name}.{column}" if scope_name else str(column),
@@ -327,19 +569,15 @@ def to_node(
         expression=select,
         source_name=source_name or "",
         reference_node_name=reference_node_name or "",
+        uncertainty_reason="; ".join(reasons),
     )
 
     if upstream:
         upstream.downstream.append(node)
 
-    subquery_scopes = {
-        id(subquery_scope.expression): subquery_scope for subquery_scope in scope.subquery_scopes
-    }
-
-    for subquery in find_all_in_scope(select, *exp.UNWRAPPED_QUERIES):
+    for subquery in in_scope_subqueries:
         subquery_scope: Scope | None = subquery_scopes.get(id(subquery))
         if not subquery_scope:
-            logger.warning(f"Unknown subquery scope: {subquery.sql(dialect=dialect)}")
             continue
 
         for name in subquery.named_selects:
@@ -359,7 +597,12 @@ def to_node(
     if isinstance(select, exp.Star):
         for src in scope.sources.values():
             src_expr = src.expression if isinstance(src, Scope) else src
-            star_node = Node(name=select.sql(comments=False), source=src_expr, expression=src_expr)
+            star_node = Node(
+                name=select.sql(comments=False),
+                source=src_expr,
+                expression=src_expr,
+                uncertainty_reason=STAR_NOT_EXPANDED_REASON,
+            )
             node.downstream.append(star_node)
             if on_node:
                 on_node(star_node)
@@ -486,6 +729,11 @@ def to_node(
                         name=downstream_column.sql(comments=False),
                         source=col_expr,
                         expression=col_expr,
+                        uncertainty_reason=(
+                            ""
+                            if col_source is not None
+                            else _unresolved_column_reason(downstream_column, scope)
+                        ),
                     )
                     node.downstream.append(pivot_leaf)
                     if on_node:
@@ -496,7 +744,12 @@ def to_node(
             # is unknown. This can happen if the definition of a source used in a query is not
             # passed into the `sources` map.
             col_expr = col_source or exp.Placeholder()
-            leaf = Node(name=c.sql(comments=False), source=col_expr, expression=col_expr)
+            leaf = Node(
+                name=c.sql(comments=False),
+                source=col_expr,
+                expression=col_expr,
+                uncertainty_reason=_leaf_uncertainty_reason(c, col_source, scope),
+            )
             node.downstream.append(leaf)
             if on_node:
                 on_node(leaf)
@@ -508,6 +761,90 @@ def to_node(
         on_node(node)
 
     return node
+
+
+def _unresolved_column_reason(column: exp.Column, scope: Scope) -> str:
+    """Explain why a column leaf could not be attributed to a source."""
+    table = column.table
+    if table:
+        return (
+            f"column '{column.sql(comments=False)}' could not be resolved: "
+            f"source '{table}' is not available in this scope"
+        )
+
+    named_sources = sorted(name for name in scope.sources if name)
+    if len(named_sources) > 1:
+        return (
+            f"unqualified column '{column.name}' is ambiguous: it cannot be attributed "
+            f"to a single source (candidates: {', '.join(named_sources)})"
+        )
+    if not named_sources:
+        return (
+            f"unqualified column '{column.name}' could not be resolved: "
+            f"the scope has no sources"
+        )
+    return f"column '{column.name}' could not be resolved"
+
+
+def _leaf_uncertainty_reason(
+    column: exp.Column, col_source: exp.Table | Scope | None, scope: Scope
+) -> str:
+    if col_source is None:
+        return _unresolved_column_reason(column, scope)
+    if isinstance(column.this, exp.Star):
+        return STAR_NOT_EXPANDED_REASON
+    return ""
+
+
+def _source_ref(node: Node) -> SourceRef | None:
+    source = node.source
+    if isinstance(source, exp.Table):
+        return SourceRef(
+            table=exp.table_name(source),
+            column=node.name.rsplit(".", 1)[-1],
+            expression=source.sql(comments=False),
+        )
+    if isinstance(source, (exp.Values, exp.UDTF)):
+        return SourceRef(table="", column=node.name, expression=source.sql(comments=False))
+    return None
+
+
+def _collect_refs(node: Node) -> tuple[tuple[SourceRef, ...], tuple[UnresolvedSource, ...]]:
+    """Collect resolved base sources and unresolved parts under a node.
+
+    Unresolved subtrees are pruned: anything below them is suspect, so it is
+    reported as unresolved rather than being mistaken for a resolved source.
+    """
+    sources: list[SourceRef] = []
+    unresolved: list[UnresolvedSource] = []
+    visited: set[int] = set()
+
+    def visit(current: Node) -> None:
+        if id(current) in visited:
+            return
+        visited.add(id(current))
+
+        if current.is_unresolved:
+            unresolved.append(
+                UnresolvedSource(
+                    reason=current.uncertainty_reason or "source could not be resolved",
+                    name=current.name,
+                    expression=current.source.sql(comments=False),
+                )
+            )
+            return
+
+        if not current.downstream:
+            ref = _source_ref(current)
+            if ref is not None:
+                sources.append(ref)
+            return
+
+        for child in current.downstream:
+            visit(child)
+
+    visit(node)
+    return tuple(dict.fromkeys(sources)), tuple(dict.fromkeys(unresolved))
 
 
 def _pre_pivot_columns(pivot: exp.Pivot, scope: Scope, schema: Schema) -> list[str]:
